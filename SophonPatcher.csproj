@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AssemblyName>SophonPatcher</AssemblyName>
+    <Product>Kitsune Sophon Patcher</Product>
+    <AssemblyTitle>LDiff extraction and HDiff patching utility.</AssemblyTitle>
+    <OutputType>Exe</OutputType>
+    <ApplicationIcon>Core\app.ico</ApplicationIcon>
+    <TargetFramework>net11.0</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <Version>1.0.0</Version>
+    <CurrentYear>$([System.DateTime]::Now.Year)</CurrentYear>
+    <Copyright>Copyright © $(CurrentYear) GesthosNetwork</Copyright>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PublishSingleFile>true</PublishSingleFile>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <PublishDir>.\bin\</PublishDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Tools\hpatchz.exe" />
+    <EmbeddedResource Include="Tools\7z.exe" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="protobuf-net" Version="*" />
+    <PackageReference Include="ZstdSharp.Port" Version="*" />
+  </ItemGroup>
+
+  <Target Name="PostPublishCleanup" AfterTargets="Publish">
+    <ItemGroup>
+      <FilesToDelete Include="$(PublishDir)**\*.pdb" />
+    </ItemGroup>
+
+    <Delete Files="@(FilesToDelete)" />
+    <RemoveDir Directories="$(ProjectDir)bin\Release;$(ProjectDir)obj" />
+  </Target>
+
+</Project>
