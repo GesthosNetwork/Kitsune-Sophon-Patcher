@@ -103,6 +103,7 @@ internal static class Program
                 int totalPhysicalChunks = 0;
                 int totalExtractedEntries = 0;
                 int totalExtractionFailures = 0;
+                int totalSkippedExtractionFiles = 0;
                 int totalPatchedFiles = 0;
                 int totalSkippedPatches = 0;
                 int totalFailedPatches = 0;
@@ -164,7 +165,7 @@ internal static class Program
                 bool verificationSucceeded = true;
                 if (extractOnly)
                 {
-                    Console.WriteLine("[INFO] Extract-only run complete. Extracted HDiff files were retained.");
+                    Console.WriteLine("[INFO] Extract-only run complete. Extracted files and patch segments were retained.");
                 }
                 else
                 {
@@ -186,10 +187,11 @@ internal static class Program
                         : "[SUCCESS] SophonPatcher has finished.");
                 Console.WriteLine($"[SUMMARY] Archives processed: {archivesProcessed:N0}");
                 Console.WriteLine($"[SUMMARY] LDiff processes: {ldiffProcesses:N0}");
-                Console.WriteLine($"[SUMMARY] Patch entries: {totalPatchEntries:N0}");
+                Console.WriteLine($"[SUMMARY] Manifest entries: {totalPatchEntries:N0}");
                 Console.WriteLine($"[SUMMARY] Referenced physical chunks: {totalPhysicalChunks:N0}");
                 Console.WriteLine($"[SUMMARY] Extracted entries: {totalExtractedEntries:N0}");
                 Console.WriteLine($"[SUMMARY] Extraction failures: {totalExtractionFailures:N0}");
+                Console.WriteLine($"[SUMMARY] Skipped incomplete files: {totalSkippedExtractionFiles:N0}");
                 Console.WriteLine($"[SUMMARY] Patched files: {totalPatchedFiles:N0}");
                 Console.WriteLine($"[SUMMARY] Skipped patches: {totalSkippedPatches:N0}");
                 Console.WriteLine($"[SUMMARY] Failed patches: {totalFailedPatches:N0}");
@@ -223,6 +225,7 @@ internal static class Program
                     totalPhysicalChunks += summary.PhysicalChunks;
                     totalExtractedEntries += summary.Extraction.ExtractedEntries.Count;
                     totalExtractionFailures += summary.Extraction.FailedFiles;
+                    totalSkippedExtractionFiles += summary.Extraction.SkippedFiles;
                     totalPatchedFiles += summary.Patching.PatchedFiles;
                     totalSkippedPatches += summary.Patching.SkippedFiles;
                     totalFailedPatches += summary.Patching.FailedFiles;
@@ -283,36 +286,73 @@ internal static class Program
         SetTitle("Reading manifest...");
         Console.WriteLine("[INFO] Reading the LDiff manifest...");
         Console.WriteLine($"[INFO] Manifest: {Path.GetFileName(input.ManifestPath)}");
-        var manifest = await Manifest.ReadAsync(input.ManifestPath);
-        string sourceVersion = SelectSourceVersion(manifest, input.ChunkDirectory);
-        List<SophonChunkFile> artifacts = Manifest.Build(manifest, sourceVersion);
+        ManifestDocument manifestDocument = await Manifest.ReadAsync(input.ManifestPath);
+        bool isChunkManifest = manifestDocument.Format == SophonManifestFormat.Chunk;
+
+        List<SophonChunkFile> artifacts;
+        if (isChunkManifest)
+        {
+            Console.WriteLine("[INFO] Manifest format: Sophon Chunk.");
+            artifacts = Manifest.Build(manifestDocument.ChunkManifest!);
+        }
+        else
+        {
+            Console.WriteLine("[INFO] Manifest format: Sophon Patch.");
+            SophonPatchManifest patchManifest = manifestDocument.PatchManifest!;
+            string sourceVersion = SelectSourceVersion(patchManifest, input.ChunkDirectory);
+            Console.WriteLine($"[INFO] Source version: {sourceVersion}");
+            artifacts = Manifest.Build(patchManifest, sourceVersion);
+        }
 
         if (artifacts.Count == 0)
-        {
-            throw new InvalidDataException($"No LDiff artifacts were found for source version '{sourceVersion}'.");
-        }
+            throw new InvalidDataException("No extractable entries were found in the LDiff manifest.");
 
         int physicalChunkCount = artifacts
             .SelectMany(entry => entry.Chunks)
             .Select(chunk => chunk.Id)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Count();
-        int newFileCount = artifacts.Count(entry => entry.IsNewFile);
-        int hdiffCount = artifacts.Count - newFileCount;
+        var chunkStore = new ChunkStore(applicationDirectory);
+        int availableChunkCount = artifacts
+            .SelectMany(entry => entry.Chunks)
+            .Select(chunk => chunk.Id)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count(chunkId => File.Exists(chunkStore.GetChunkPath(chunkId)));
+        int newFileCount = artifacts.Count(entry => entry.IsNewFile && !entry.IsFolder);
+        int hdiffCount = artifacts.Count(entry => !entry.IsNewFile);
+        int completeChunkFiles = isChunkManifest
+            ? artifacts.Count(entry => !entry.IsFolder && entry.Chunks.All(chunk => File.Exists(chunkStore.GetChunkPath(chunk.Id))))
+            : 0;
 
-        Console.WriteLine($"[INFO] Source version: {sourceVersion}");
-        Console.WriteLine($"[INFO] Patch entries: {artifacts.Count:N0}");
-        Console.WriteLine($"[INFO] Physical chunk files: {physicalChunkCount:N0}");
-        Console.WriteLine($"[INFO] HDiff entries: {hdiffCount:N0}");
-        Console.WriteLine($"[INFO] New-file entries: {newFileCount:N0}\n");
+        Console.WriteLine($"[INFO] Manifest entries: {artifacts.Count:N0}");
+        Console.WriteLine(isChunkManifest
+            ? $"[INFO] Physical chunk files available: {availableChunkCount:N0}/{physicalChunkCount:N0}"
+            : $"[INFO] Physical chunk files: {physicalChunkCount:N0}");
+        if (isChunkManifest)
+            Console.WriteLine($"[INFO] Files with all chunks available: {completeChunkFiles:N0}/{newFileCount:N0}");
+        else
+        {
+            Console.WriteLine($"[INFO] HDiff entries: {hdiffCount:N0}");
+            Console.WriteLine($"[INFO] New-file entries: {newFileCount:N0}");
+        }
+        Console.WriteLine();
 
         SetTitle("Extracting LDiff...");
-        Console.WriteLine("[INFO] Extracting LDiff segments and new files...");
-        ExtractSummary extractionSummary = await new Extract()
-            .ExtractAsync(artifacts, applicationDirectory);
+        Console.WriteLine(isChunkManifest
+            ? "[INFO] Reconstructing files from Zstandard chunks..."
+            : "[INFO] Extracting LDiff segments and new files...");
+
+        var extractor = new Extract();
+        ExtractSummary extractionSummary = isChunkManifest
+            ? await extractor.ExtractChunkManifestAsync(artifacts, applicationDirectory)
+            : await extractor.ExtractAsync(artifacts, applicationDirectory);
 
         PatchSummary patchSummary = new(0, 0, 0);
-        if (extractOnly)
+        if (isChunkManifest)
+        {
+            Console.WriteLine("[INFO] Sophon Chunk files are complete files; HDiff patch application is not required.");
+        }
+        else if (extractOnly)
         {
             Console.WriteLine("[INFO] Extract-only mode: HDiff patch application was skipped.");
         }
@@ -329,6 +369,7 @@ internal static class Program
     private static void EnsureProcessSucceeded(InputSummary summary, string processName, bool extractOnly)
     {
         if (summary.Extraction.FailedFiles > 0 ||
+            (summary.Extraction.SkippedFiles > 0 && summary.Extraction.ExtractedEntries.Count == 0) ||
             (!extractOnly && (summary.Patching.SkippedFiles > 0 || summary.Patching.FailedFiles > 0)))
         {
             string operation = extractOnly ? "extraction" : "extraction or patching";

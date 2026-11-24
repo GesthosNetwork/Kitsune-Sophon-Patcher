@@ -7,7 +7,8 @@ namespace SophonPatcher.Core;
 
 public sealed record ExtractSummary(
     IReadOnlyList<SophonChunkFile> ExtractedEntries,
-    int FailedFiles);
+    int FailedFiles,
+    int SkippedFiles = 0);
 
 public sealed class Extract
 {
@@ -118,13 +119,232 @@ public sealed class Extract
         return new ExtractSummary(extracted, failed);
     }
 
+    public async Task<ExtractSummary> ExtractChunkManifestAsync(
+        List<SophonChunkFile> allFiles,
+        string saveDirectory,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(allFiles);
+        if (string.IsNullOrWhiteSpace(saveDirectory))
+            throw new ArgumentException("Save directory cannot be empty.", nameof(saveDirectory));
+
+        string root = Path.GetFullPath(saveDirectory);
+        var chunkStore = new ChunkStore(root);
+        if (!Directory.Exists(chunkStore.ChunkDirectory))
+            throw new DirectoryNotFoundException($"Chunk cache not found: {chunkStore.ChunkDirectory}");
+
+        var files = allFiles.Where(entry => !entry.IsFolder).ToList();
+        int uniqueChunkCount = files
+            .SelectMany(file => file.Chunks)
+            .Select(chunk => chunk.Id)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+
+        ProgressBar.WriteLine(
+            $"[INFO] Starting Sophon Chunk reconstruction. Files={files.Count:N0}; " +
+            $"PhysicalChunks={uniqueChunkCount:N0}.");
+
+        foreach (SophonChunkFile folder in allFiles.Where(entry => entry.IsFolder))
+        {
+            string folderPath = Path.GetFullPath(Path.Combine(root, folder.TargetFile));
+            EnsurePathInsideSaveDirectory(root, folderPath);
+            Directory.CreateDirectory(folderPath);
+        }
+
+        var validatedChunks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var invalidChunks = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var extracted = new List<SophonChunkFile>(files.Count);
+        var errors = new List<string>();
+        int skipped = 0;
+        int failed = 0;
+
+        if (files.Count == 0)
+        {
+            ProgressBar.WriteLine("[INFO] The Chunk manifest contains no regular files to reconstruct.");
+            return new ExtractSummary(extracted, 0, 0);
+        }
+
+        ProgressBar.Report("EXTRACT", 0, files.Count);
+        try
+        {
+            for (int index = 0; index < files.Count; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                SophonChunkFile entry = files[index];
+                bool itemFinished = false;
+
+                try
+                {
+                    string[] missingChunks = entry.Chunks
+                        .Select(chunk => chunk.Id)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .Where(chunkId => !File.Exists(chunkStore.GetChunkPath(chunkId)))
+                        .ToArray();
+
+                    if (missingChunks.Length > 0)
+                    {
+                        skipped++;
+                        itemFinished = true;
+                        continue;
+                    }
+
+                    foreach (SophonChunk chunk in entry.Chunks)
+                    {
+                        if (invalidChunks.TryGetValue(chunk.Id, out string? priorError))
+                        {
+                            throw new InvalidDataException(
+                                $"Chunk '{chunk.Id}' previously failed validation: {priorError}");
+                        }
+
+                        if (validatedChunks.Contains(chunk.Id))
+                            continue;
+
+                        try
+                        {
+                            await ValidatePhysicalChunkAsync(chunk, chunkStore, cancellationToken);
+                            validatedChunks.Add(chunk.Id);
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            invalidChunks[chunk.Id] = ex.Message;
+                            throw;
+                        }
+                    }
+
+                    await ExtractSophonChunkFileAsync(entry, chunkStore, root, cancellationToken);
+                    extracted.Add(entry);
+                    itemFinished = true;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    errors.Add($"[ERROR] [CHUNK] {entry.TargetFile}: {ex.Message}");
+                    itemFinished = true;
+                }
+                finally
+                {
+                    if (itemFinished)
+                        ProgressBar.Report("EXTRACT", index + 1, files.Count, $"CHUNK: {entry.TargetFile}");
+                }
+            }
+        }
+        finally
+        {
+            ProgressBar.End();
+        }
+
+        foreach (string error in errors)
+            ProgressBar.WriteLine(error);
+
+        ProgressBar.WriteLine(
+            $"[INFO] Sophon Chunk reconstruction finished. Extracted={extracted.Count:N0}; " +
+            $"Skipped (incomplete)={skipped:N0}; Failed={failed:N0}.\n");
+        return new ExtractSummary(extracted, failed, skipped);
+    }
+
+    private static async Task ExtractSophonChunkFileAsync(
+        SophonChunkFile entry,
+        ChunkStore chunkStore,
+        string root,
+        CancellationToken cancellationToken)
+    {
+        (string outputPath, string temporaryPath) = PrepareOutputPaths(root, entry.TargetFile);
+        TryDeleteFile(temporaryPath);
+
+        try
+        {
+            await using (var output = new FileStream(
+                temporaryPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, BufferSize,
+                FileOptions.Asynchronous | FileOptions.RandomAccess))
+            {
+                output.SetLength(entry.TargetSize);
+
+                foreach (SophonChunk chunk in entry.Chunks.OrderBy(chunk => chunk.Offset))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    await using FileStream input = chunkStore.OpenChunk(chunk.Id);
+                    using var decompressor = new DecompressionStream(input);
+                    using var chunkMd5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+
+                    output.Position = chunk.Offset;
+                    byte[] buffer = new byte[BufferSize];
+                    long written = 0;
+
+                    while (true)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        int read = await decompressor.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken);
+                        if (read == 0)
+                            break;
+
+                        if (written > chunk.UncompressedSize - read)
+                        {
+                            throw new InvalidDataException(
+                                $"Decompressed chunk '{chunk.Id}' exceeds its declared uncompressed size.");
+                        }
+
+                        await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                        chunkMd5.AppendData(buffer, 0, read);
+                        written += read;
+                    }
+
+                    if (written != chunk.UncompressedSize)
+                    {
+                        throw new InvalidDataException(
+                            $"Uncompressed chunk size mismatch for '{chunk.Id}': " +
+                            $"expected {chunk.UncompressedSize:N0}, actual {written:N0}.");
+                    }
+
+                    string actualChunkMd5 = Convert.ToHexString(chunkMd5.GetHashAndReset()).ToLowerInvariant();
+                    if (!string.IsNullOrWhiteSpace(chunk.UncompressedMd5) &&
+                        !actualChunkMd5.Equals(chunk.UncompressedMd5, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidDataException(
+                            $"Uncompressed chunk MD5 mismatch for '{chunk.Id}': " +
+                            $"expected {chunk.UncompressedMd5}, actual {actualChunkMd5}.");
+                    }
+                }
+
+                await output.FlushAsync(cancellationToken);
+                if (output.Length != entry.TargetSize)
+                {
+                    throw new InvalidDataException(
+                        $"Reconstructed file size mismatch for '{entry.TargetFile}': " +
+                        $"expected {entry.TargetSize:N0}, actual {output.Length:N0}.");
+                }
+
+                output.Position = 0;
+                string actualFileMd5 = await CalculateMd5Async(output, cancellationToken);
+                if (!string.IsNullOrWhiteSpace(entry.TargetMd5) &&
+                    !actualFileMd5.Equals(entry.TargetMd5, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException(
+                        $"Reconstructed file MD5 mismatch for '{entry.TargetFile}': " +
+                        $"expected {entry.TargetMd5}, actual {actualFileMd5}.");
+                }
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(temporaryPath, outputPath, overwrite: true);
+        }
+        catch
+        {
+            TryDeleteFile(temporaryPath);
+            throw;
+        }
+    }
+
     private static async Task ValidatePhysicalChunkAsync(
         SophonChunk chunk,
         ChunkStore chunkStore,
         CancellationToken cancellationToken)
     {
         await using FileStream stream = chunkStore.OpenChunk(chunk.Id);
-        if (stream.Length != chunk.CompressedSize)
+        if (chunk.CompressedSize > 0 && stream.Length != chunk.CompressedSize)
         {
             throw new InvalidDataException(
                 $"Physical chunk size mismatch for '{chunk.Id}': " +

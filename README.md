@@ -2,6 +2,8 @@
 
 A lightweight tool for extracting Sophon LDiff update data, applying HDiffPatch updates, and verifying game files.
 
+Version 1.0.1 supports both Sophon Chunk and Sophon Patch manifest formats. Chunk manifests are reconstructed directly from Zstandard-compressed chunks, while Patch manifests retain the existing HDiff extraction and patching workflow.
+
 
 ## Compile Instructions
 
@@ -120,7 +122,7 @@ After an patching has been processed successfully, ldiff folder and manifest fil
 
 | Command | Description |
 |---|---|
-| `SophonPatcher.exe --extract` or `-e` | Extract LDiff segments and new-file payloads only. |
+| `SophonPatcher.exe --extract` or `-e` | Reconstruct complete files from Chunk manifests or extract Patch-manifest data only; skip HDiff application and final verification. |
 | `SophonPatcher.exe --verify` or `-v` | Verify game files only; do not apply patches. |
 | `SophonPatcher.exe --help` or `-h` | Display available options and usage information. |
 
@@ -133,7 +135,19 @@ With no arguments, the application runs the full Extract chunk files and Patch w
 - Each LDiff archive is processed separately because its manifest and `ldiff` cache are extracted into the same game directory.
 - Extracted archive contents are written to the game directory.
 - Final verification is skipped when no supported `pkg_version` files are found.
-- Game and version compatibility depends on the manifest and payload formats used by the update. Not every game or release has necessarily been tested.
+- Both Sophon Chunk manifests and Sophon Patch manifests are supported. Chunk manifests reconstruct complete files directly from their Zstandard chunks; files with missing chunks are skipped, while present chunks and reconstructed files are checksum-validated.
+- Patch manifests continue to use the existing source-version selection, HDiff extraction, patch application, and verification workflow.
+- Game and version compatibility still depends on the manifest and payload formats used by the update. Not every game or release has necessarily been tested.
+
+## Changelog
+
+### v1.0.1
+
+- Added automatic detection for Sophon Chunk and Sophon Patch manifest formats.
+- Added direct reconstruction of files from multiple Zstandard chunks using manifest offsets.
+- Added compressed-chunk size/MD5 checks, uncompressed-chunk size/MD5 checks, and final file size/MD5 validation.
+- Incomplete files are skipped when their required chunks are not present, allowing partially selected content archives to be processed.
+- Preserved the existing Patch manifest and HDiff workflow.
 
 
 ## Disclaimer

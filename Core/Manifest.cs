@@ -4,9 +4,22 @@ using ZstdSharp;
 
 namespace SophonPatcher.Core;
 
+public enum SophonManifestFormat
+{
+    Patch,
+    Chunk
+}
+
+public sealed record ManifestDocument(
+    SophonManifestFormat Format,
+    SophonPatchManifest? PatchManifest,
+    SophonChunkManifest? ChunkManifest);
+
 public static class Manifest
 {
-    public static async Task<SophonPatchManifest> ReadAsync(
+    private static readonly byte[] ZstdMagic = [0x28, 0xB5, 0x2F, 0xFD];
+
+    public static async Task<ManifestDocument> ReadAsync(
         string manifestPath,
         CancellationToken cancellationToken = default)
     {
@@ -14,23 +27,106 @@ public static class Manifest
         if (manifestBytes.Length == 0)
             throw new InvalidDataException("The LDiff manifest is empty.");
 
-        SophonPatchManifest patchManifest;
-        try
+        bool isZstd = manifestBytes.AsSpan().StartsWith(ZstdMagic);
+        byte[] protobufBytes = manifestBytes;
+        Exception? decompressionError = null;
+
+        if (isZstd)
         {
-            using MemoryStream direct = new(manifestBytes);
-            patchManifest = Serializer.Deserialize<SophonPatchManifest>(direct);
-            if (patchManifest.Patches.Count == 0)
-                throw new InvalidDataException("Direct LDiff protobuf was empty.");
-        }
-        catch
-        {
-            using Decompressor decompressor = new();
-            byte[] decompressedManifest = decompressor.Unwrap(manifestBytes).ToArray();
-            using MemoryStream decompressed = new(decompressedManifest);
-            patchManifest = Serializer.Deserialize<SophonPatchManifest>(decompressed);
+            try
+            {
+                using Decompressor decompressor = new();
+                protobufBytes = decompressor.Unwrap(manifestBytes).ToArray();
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidDataException("The LDiff manifest has a Zstandard header but could not be decompressed.", ex);
+            }
         }
 
-        return patchManifest;
+        if (TryDeserializeDocument(protobufBytes, out ManifestDocument? document, out string parseErrors))
+            return document!;
+
+        if (!isZstd)
+        {
+            try
+            {
+                using Decompressor decompressor = new();
+                byte[] decompressed = decompressor.Unwrap(manifestBytes).ToArray();
+                if (TryDeserializeDocument(decompressed, out document, out string decompressedErrors))
+                    return document!;
+                parseErrors += $" Decompressed parse: {decompressedErrors}";
+            }
+            catch (Exception ex)
+            {
+                decompressionError = ex;
+            }
+        }
+
+        string message = "The LDiff manifest is not a supported Sophon Chunk or Patch manifest." +
+            (string.IsNullOrWhiteSpace(parseErrors) ? string.Empty : $" {parseErrors}");
+        throw decompressionError is null
+            ? new InvalidDataException(message)
+            : new InvalidDataException(message, decompressionError);
+    }
+
+    private static bool TryDeserializeDocument(
+        byte[] protobufBytes,
+        out ManifestDocument? document,
+        out string errors)
+    {
+        var failures = new List<string>(2);
+
+        try
+        {
+            using MemoryStream stream = new(protobufBytes, writable: false);
+            SophonChunkManifest chunkManifest = Serializer.Deserialize<SophonChunkManifest>(stream);
+            if (IsValidChunkManifest(chunkManifest))
+            {
+                document = new ManifestDocument(SophonManifestFormat.Chunk, null, chunkManifest);
+                errors = string.Empty;
+                return true;
+            }
+            failures.Add("Chunk manifest validation found no file entries.");
+        }
+        catch (Exception ex)
+        {
+            failures.Add($"Chunk parser: {ex.Message}");
+        }
+
+        try
+        {
+            using MemoryStream stream = new(protobufBytes, writable: false);
+            SophonPatchManifest patchManifest = Serializer.Deserialize<SophonPatchManifest>(stream);
+            if (IsValidPatchManifest(patchManifest))
+            {
+                document = new ManifestDocument(SophonManifestFormat.Patch, patchManifest, null);
+                errors = string.Empty;
+                return true;
+            }
+            failures.Add("Patch manifest validation found no patch entries.");
+        }
+        catch (Exception ex)
+        {
+            failures.Add($"Patch parser: {ex.Message}");
+        }
+
+        document = null;
+        errors = string.Join(" ", failures);
+        return false;
+    }
+
+    private static bool IsValidChunkManifest(SophonChunkManifest manifest)
+    {
+        return manifest.Files.Count > 0 &&
+            manifest.Files.Any(file => !string.IsNullOrWhiteSpace(file.File)) &&
+            manifest.Files.All(file => file.Chunks.All(chunk => !string.IsNullOrWhiteSpace(chunk.Id)));
+    }
+
+    private static bool IsValidPatchManifest(SophonPatchManifest manifest)
+    {
+        return manifest.Patches.Count > 0 &&
+            manifest.Patches.Any(file => !string.IsNullOrWhiteSpace(file.File));
     }
 
     public static List<SophonChunkFile> Build(
@@ -119,6 +215,157 @@ public static class Manifest
         ValidateNewFileSourceCollisions(allFiles);
         return allFiles;
     }
+
+    public static List<SophonChunkFile> Build(SophonChunkManifest chunkManifest)
+    {
+        ArgumentNullException.ThrowIfNull(chunkManifest);
+        if (chunkManifest.Files.Count == 0)
+            throw new InvalidDataException("The Sophon Chunk manifest contains no files.");
+
+        var allFiles = new List<SophonChunkFile>(chunkManifest.Files.Count);
+        var artifactPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var physicalChunks = new Dictionary<string, ChunkMetadata>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (SophonChunkManifestFile manifestFile in chunkManifest.Files)
+        {
+            string targetFile = NormalizeRelativePath(manifestFile.File, "target file");
+            if (!artifactPaths.Add(targetFile))
+                throw new InvalidDataException($"Duplicate target path in Sophon Chunk manifest: '{targetFile}'.");
+            if (manifestFile.Size < 0)
+                throw new InvalidDataException($"Negative target size in manifest for '{targetFile}'.");
+            if (manifestFile.IsFolder && manifestFile.Chunks.Count > 0)
+                throw new InvalidDataException($"Folder entry '{targetFile}' unexpectedly contains file chunks.");
+
+            var artifact = new SophonChunkFile
+            {
+                File = targetFile,
+                TargetFile = targetFile,
+                IsNewFile = true,
+                IsFolder = manifestFile.IsFolder,
+                IsChunkManifestFile = true,
+                TargetSize = manifestFile.Size,
+                TargetMd5 = manifestFile.Md5 ?? string.Empty
+            };
+
+            foreach (SophonManifestChunk manifestChunk in manifestFile.Chunks)
+            {
+                ValidateChunkId(manifestChunk.Id, targetFile);
+
+                if (manifestChunk.Offset < 0 ||
+                    manifestChunk.CompressedSize < 0 ||
+                    manifestChunk.UncompressedSize < 0 ||
+                    (manifestChunk.UncompressedSize > 0 && manifestChunk.CompressedSize == 0))
+                {
+                    throw new InvalidDataException(
+                        $"Invalid chunk metadata for '{targetFile}' ({manifestChunk.Id}): " +
+                        $"offset={manifestChunk.Offset}, compressedSize={manifestChunk.CompressedSize}, " +
+                        $"uncompressedSize={manifestChunk.UncompressedSize}.");
+                }
+
+                long rangeEnd;
+                try { rangeEnd = checked(manifestChunk.Offset + manifestChunk.UncompressedSize); }
+                catch (OverflowException ex)
+                {
+                    throw new InvalidDataException($"Chunk range overflows for '{targetFile}' ({manifestChunk.Id}).", ex);
+                }
+
+                if (rangeEnd > manifestFile.Size)
+                {
+                    throw new InvalidDataException(
+                        $"Chunk range exceeds target file '{targetFile}': " +
+                        $"end={rangeEnd}, fileSize={manifestFile.Size}.");
+                }
+
+                artifact.Chunks.Add(new SophonChunk
+                {
+                    Id = manifestChunk.Id,
+                    CompressedSize = manifestChunk.CompressedSize,
+                    CompressedMd5 = manifestChunk.CompressedMd5 ?? string.Empty,
+                    UncompressedMd5 = manifestChunk.UncompressedMd5 ?? string.Empty,
+                    Offset = manifestChunk.Offset,
+                    Length = manifestChunk.UncompressedSize,
+                    UncompressedSize = manifestChunk.UncompressedSize,
+                    Unknown = manifestChunk.Unknown
+                });
+
+                var currentMetadata = new ChunkMetadata(
+                    manifestChunk.CompressedSize,
+                    manifestChunk.CompressedMd5 ?? string.Empty,
+                    manifestChunk.UncompressedSize,
+                    manifestChunk.UncompressedMd5 ?? string.Empty);
+
+                if (!physicalChunks.TryGetValue(manifestChunk.Id, out ChunkMetadata? existing))
+                {
+                    physicalChunks.Add(manifestChunk.Id, currentMetadata);
+                }
+                else
+                {
+                    if (existing.CompressedSize != currentMetadata.CompressedSize ||
+                        !existing.CompressedMd5.Equals(currentMetadata.CompressedMd5, StringComparison.OrdinalIgnoreCase) ||
+                        existing.UncompressedSize != currentMetadata.UncompressedSize ||
+                        !existing.UncompressedMd5.Equals(currentMetadata.UncompressedMd5, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidDataException(
+                            $"Manifest contains inconsistent physical chunk metadata for '{manifestChunk.Id}'.");
+                    }
+                }
+            }
+
+            ValidateChunkCoverage(artifact);
+            allFiles.Add(artifact);
+        }
+
+        return allFiles;
+    }
+
+    private static void ValidateChunkCoverage(SophonChunkFile entry)
+    {
+        if (entry.IsFolder)
+            return;
+
+        if (entry.Chunks.Count == 0)
+        {
+            if (entry.TargetSize != 0)
+                throw new InvalidDataException($"File '{entry.TargetFile}' has a non-zero size but no chunk references.");
+            return;
+        }
+
+        long expectedOffset = 0;
+        foreach (SophonChunk chunk in entry.Chunks.OrderBy(chunk => chunk.Offset))
+        {
+            if (chunk.Offset != expectedOffset)
+            {
+                throw new InvalidDataException(
+                    $"Chunk ranges for '{entry.TargetFile}' contain a gap or overlap at offset {expectedOffset:N0}.");
+            }
+            expectedOffset = checked(chunk.Offset + chunk.UncompressedSize);
+        }
+
+        if (expectedOffset != entry.TargetSize)
+        {
+            throw new InvalidDataException(
+                $"Chunk ranges for '{entry.TargetFile}' cover {expectedOffset:N0} bytes, " +
+                $"but the target file size is {entry.TargetSize:N0} bytes.");
+        }
+    }
+
+    private static void ValidateChunkId(string chunkId, string targetFile)
+    {
+        if (string.IsNullOrWhiteSpace(chunkId) ||
+            chunkId.Contains('/') ||
+            chunkId.Contains('\\') ||
+            chunkId is "." or ".." ||
+            chunkId.Contains("..", StringComparison.Ordinal))
+        {
+            throw new InvalidDataException($"Invalid physical chunk ID for '{targetFile}': '{chunkId}'.");
+        }
+    }
+
+    private sealed record ChunkMetadata(
+        long CompressedSize,
+        string CompressedMd5,
+        long UncompressedSize,
+        string UncompressedMd5);
 
     private static void ValidatePhysicalChunkReferences(IEnumerable<SophonChunkFile> entries)
     {

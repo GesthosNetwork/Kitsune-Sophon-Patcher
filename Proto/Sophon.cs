@@ -65,6 +65,7 @@ public sealed class SophonPatchDeleteTag
 public sealed class SophonChunkFile
 {
     public string File { get; set; } = string.Empty;
+    public bool IsChunkManifestFile { get; set; }
     public string TargetFile { get; set; } = string.Empty;
     public string SourceFile { get; set; } = string.Empty;
     public bool IsNewFile { get; set; }
@@ -87,4 +88,35 @@ public sealed class SophonChunk
     public string CompressedMd5 { get; set; } = string.Empty;
     public long Offset { get; set; }
     public long Length { get; set; }
+    public long UncompressedSize { get; set; }
+    public string UncompressedMd5 { get; set; } = string.Empty;
+    public long Unknown { get; set; }
+}
+
+[ProtoContract]
+public sealed class SophonChunkManifest
+{
+    [ProtoMember(1)] public List<SophonChunkManifestFile> Files { get; set; } = new();
+}
+
+[ProtoContract]
+public sealed class SophonChunkManifestFile
+{
+    [ProtoMember(1)] public string File { get; set; } = string.Empty;
+    [ProtoMember(2)] public List<SophonManifestChunk> Chunks { get; set; } = new();
+    [ProtoMember(3)] public bool IsFolder { get; set; }
+    [ProtoMember(4)] public long Size { get; set; }
+    [ProtoMember(5)] public string Md5 { get; set; } = string.Empty;
+}
+
+[ProtoContract]
+public sealed class SophonManifestChunk
+{
+    [ProtoMember(1)] public string Id { get; set; } = string.Empty;
+    [ProtoMember(2)] public string UncompressedMd5 { get; set; } = string.Empty;
+    [ProtoMember(3)] public long Offset { get; set; }
+    [ProtoMember(4)] public long CompressedSize { get; set; }
+    [ProtoMember(5)] public long UncompressedSize { get; set; }
+    [ProtoMember(6)] public long Unknown { get; set; }
+    [ProtoMember(7)] public string CompressedMd5 { get; set; } = string.Empty;
 }
