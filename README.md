@@ -2,8 +2,6 @@
 
 A lightweight tool for extracting Sophon LDiff update data, applying HDiffPatch updates, and verifying game files.
 
-Version 1.0.1 supports both Sophon Chunk and Sophon Patch manifest formats. Chunk manifests are reconstructed directly from Zstandard-compressed chunks, while Patch manifests retain the existing HDiff extraction and patching workflow.
-
 
 ## Compile Instructions
 
@@ -137,17 +135,17 @@ With no arguments, the application runs the full Extract chunk files and Patch w
 - Final verification is skipped when no supported `pkg_version` files are found.
 - Both Sophon Chunk manifests and Sophon Patch manifests are supported. Chunk manifests reconstruct complete files directly from their Zstandard chunks; files with missing chunks are skipped, while present chunks and reconstructed files are checksum-validated.
 - Patch manifests continue to use the existing source-version selection, HDiff extraction, patch application, and verification workflow.
+- Replaced protobuf-net with a focused Protocol Buffers wire reader, removing its reflection-based trim-warning source without warning suppression.
 - Game and version compatibility still depends on the manifest and payload formats used by the update. Not every game or release has necessarily been tested.
 
 ## Changelog
 
-### v1.0.1
+### v1.0.2
 
-- Added automatic detection for Sophon Chunk and Sophon Patch manifest formats.
-- Added direct reconstruction of files from multiple Zstandard chunks using manifest offsets.
-- Added compressed-chunk size/MD5 checks, uncompressed-chunk size/MD5 checks, and final file size/MD5 validation.
-- Incomplete files are skipped when their required chunks are not present, allowing partially selected content archives to be processed.
-- Preserved the existing Patch manifest and HDiff workflow.
+- Replaced protobuf-net manifest deserialization with a built-in Protocol Buffers wire-format reader.
+- Removed the protobuf-net dependency and its reflection-based serializer path to make manifest parsing compatible with `PublishTrimmed`.
+- Retained support for both Sophon Chunk and Sophon Patch manifest formats.
+- Kept the existing Chunk reconstruction, checksum validation, and Patch/HDiff workflows.
 
 
 ## Disclaimer

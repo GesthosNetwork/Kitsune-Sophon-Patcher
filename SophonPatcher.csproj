@@ -9,14 +9,14 @@
     <TargetFramework>net11.0</TargetFramework>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <CurrentYear>$([System.DateTime]::Now.Year)</CurrentYear>
     <Copyright>Copyright © $(CurrentYear) GesthosNetwork</Copyright>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PublishSingleFile>true</PublishSingleFile>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
-    <PublishTrimmed>false</PublishTrimmed>
+    <PublishTrimmed>true</PublishTrimmed>
     <InvariantGlobalization>true</InvariantGlobalization>
     <PublishDir>.\bin\</PublishDir>
   </PropertyGroup>
@@ -27,8 +27,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="protobuf-net" Version="*" />
-    <PackageReference Include="protobuf-net.Core" Version="*" />
     <PackageReference Include="ZstdSharp.Port" Version="*" />
   </ItemGroup>
 

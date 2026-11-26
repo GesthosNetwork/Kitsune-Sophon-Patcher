@@ -1,4 +1,3 @@
-using ProtoBuf;
 using SophonPatcher.Proto;
 using ZstdSharp;
 
@@ -47,6 +46,8 @@ public static class Manifest
         if (TryDeserializeDocument(protobufBytes, out ManifestDocument? document, out string parseErrors))
             return document!;
 
+        // Some Sophon servers provide an uncompressed protobuf manifest. Keep a fallback
+        // for compressed manifests that do not use the standard frame magic at byte zero.
         if (!isZstd)
         {
             try
@@ -79,8 +80,7 @@ public static class Manifest
 
         try
         {
-            using MemoryStream stream = new(protobufBytes, writable: false);
-            SophonChunkManifest chunkManifest = Serializer.Deserialize<SophonChunkManifest>(stream);
+            SophonChunkManifest chunkManifest = SophonManifestReader.ParseChunkManifest(protobufBytes);
             if (IsValidChunkManifest(chunkManifest))
             {
                 document = new ManifestDocument(SophonManifestFormat.Chunk, null, chunkManifest);
@@ -96,8 +96,7 @@ public static class Manifest
 
         try
         {
-            using MemoryStream stream = new(protobufBytes, writable: false);
-            SophonPatchManifest patchManifest = Serializer.Deserialize<SophonPatchManifest>(stream);
+            SophonPatchManifest patchManifest = SophonManifestReader.ParsePatchManifest(protobufBytes);
             if (IsValidPatchManifest(patchManifest))
             {
                 document = new ManifestDocument(SophonManifestFormat.Patch, patchManifest, null);
